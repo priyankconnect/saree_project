@@ -195,14 +195,16 @@ print(data)
 
 from torch_geometric.nn import GCNConv
 import torch.nn.functional as F
+import math
 
 
 class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.4):
+    def __init__(self, in_channels, hidden_channels, embedding_channels, dropout=0.4):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
-        self.conv3 = GCNConv(hidden_channels, out_channels)
+        # (b) modified GCN output: refined embeddings, not class logits
+        self.conv3 = GCNConv(hidden_channels, embedding_channels)
         self.dropout = dropout
 
     def forward(self, x, edge_index):
@@ -218,15 +220,52 @@ class GCN(torch.nn.Module):
         return x
 
 
+# (a) new ArcFace module
+class ArcFaceLoss(nn.Module):
+    def __init__(self, embedding_dim, num_classes, scale=30.0, margin=0.5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.scale = scale
+        self.margin = margin
+        self.cos_m = math.cos(margin)
+        self.sin_m = math.sin(margin)
+        self.th = math.cos(math.pi - margin)
+        self.mm = math.sin(math.pi - margin) * margin
+
+    def logits(self, embeddings):
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        weights = F.normalize(self.weight, p=2, dim=1)
+        return F.linear(embeddings, weights) * self.scale
+
+    def forward(self, embeddings, labels):
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        weights = F.normalize(self.weight, p=2, dim=1)
+        cosine = F.linear(embeddings, weights).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        one_hot = F.one_hot(labels, num_classes=self.weight.size(0)).float()
+        logits = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        logits = logits * self.scale
+        return F.cross_entropy(logits, labels), logits
+
+
 num_features = data.x.shape[1]
 num_classes = int(data.y.max().item() + 1)
+embedding_dim = 256
 
-gcn_model = GCN(in_channels=num_features, hidden_channels=512, out_channels=num_classes, dropout=0.5).to(DEVICE)
+gcn_model = GCN(in_channels=num_features, hidden_channels=512, embedding_channels=embedding_dim, dropout=0.5).to(DEVICE)
+criterion = ArcFaceLoss(embedding_dim=embedding_dim, num_classes=num_classes, scale=30.0, margin=0.5).to(DEVICE)
 data = data.to(DEVICE)
 
 # same optimizer/lr/wd as ResNet50+GCN
-optimizer = torch.optim.Adam(gcn_model.parameters(), lr=1e-3, weight_decay=5e-4)
-criterion = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(
+    list(gcn_model.parameters()) + list(criterion.parameters()),
+    lr=1e-3,
+    weight_decay=5e-4
+)
 
 print(gcn_model)
 
@@ -239,11 +278,12 @@ def accuracy(logits, labels):
 
 def evaluate(model, data, mask):
     model.eval()
+    criterion.eval()
     with torch.no_grad():
-        out = model(data.x, data.edge_index)
-        loss = criterion(out[mask], data.y[mask]).item()
-        acc = accuracy(out[mask], data.y[mask])
-    return loss, acc
+        embeddings = model(data.x, data.edge_index)
+        loss, logits = criterion(embeddings[mask], data.y[mask])
+        acc = accuracy(logits, data.y[mask])
+    return loss.item(), acc
 
 
 EPOCHS = 200
@@ -252,13 +292,15 @@ history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
 for epoch in range(1, EPOCHS + 1):
     gcn_model.train()
+    criterion.train()
     optimizer.zero_grad()
-    out = gcn_model(data.x, data.edge_index)
-    loss = criterion(out[data.train_mask], data.y[data.train_mask])
+    # (c) modified training step: GCN embeddings -> ArcFace loss
+    embeddings = gcn_model(data.x, data.edge_index)
+    loss, train_logits = criterion(embeddings[data.train_mask], data.y[data.train_mask])
     loss.backward()
     optimizer.step()
 
-    train_acc = accuracy(out[data.train_mask], data.y[data.train_mask])
+    train_acc = accuracy(train_logits, data.y[data.train_mask])
     val_loss, val_acc = evaluate(gcn_model, data, data.val_mask)
 
     history["train_loss"].append(loss.item())
@@ -268,7 +310,10 @@ for epoch in range(1, EPOCHS + 1):
 
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(gcn_model.state_dict(), MODEL_SAVE_PATH)
+        torch.save({
+            "gcn_model": gcn_model.state_dict(),
+            "arcface": criterion.state_dict(),
+        }, MODEL_SAVE_PATH)
 
     if epoch % 10 == 0 or epoch == 1:
         print(
@@ -298,9 +343,16 @@ else:
     print("No trained model found; run training cell first.")
 
 if os.path.exists(local_model_path):
-    gcn_model.load_state_dict(torch.load(local_model_path, map_location=DEVICE))
+    checkpoint = torch.load(local_model_path, map_location=DEVICE)
+    if isinstance(checkpoint, dict) and "gcn_model" in checkpoint:
+        gcn_model.load_state_dict(checkpoint["gcn_model"])
+        criterion.load_state_dict(checkpoint["arcface"])
+    else:
+        print("Skipping legacy CrossEntropy checkpoint; retrain once with ArcFace.")
     gcn_model.to(DEVICE)
+    criterion.to(DEVICE)
     gcn_model.eval()
+    criterion.eval()
 
 """# # 13) Test evaluation + confusion matrix"""
 
@@ -317,8 +369,10 @@ class_names = sorted([
 ])
 
 gcn_model.eval()
+criterion.eval()
 with torch.no_grad():
-    logits = gcn_model(data.x, data.edge_index)
+    embeddings = gcn_model(data.x, data.edge_index)
+    logits = criterion.logits(embeddings)
 
 pred_all = logits.argmax(dim=1).cpu().numpy()
 true_all = data.y.cpu().numpy()
@@ -392,10 +446,7 @@ plt.show()
 from sklearn.manifold import TSNE
 
 with torch.no_grad():
-    x1 = gcn_model.conv1(data.x, data.edge_index)
-    x1 = F.relu(x1)
-    x2 = gcn_model.conv2(x1, data.edge_index)
-    node_repr = F.relu(x2).cpu().numpy()
+    node_repr = gcn_model(data.x, data.edge_index).cpu().numpy()
 
 class_names = sorted([
     d for d in os.listdir(os.path.join(DATASET_ROOT, "train"))
@@ -578,4 +629,3 @@ plt.show()
 
 print("Query Image:", test_paths[query_index])
 print("Query Label:", class_names[test_labels[query_index]])
-
