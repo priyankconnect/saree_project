@@ -23,6 +23,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from torchvision import models, transforms
 
 """# Install PyG in a fresh runtime"""
@@ -42,7 +43,9 @@ DATASET_ROOT = "/content/content/dataset_split"
 UNSEEN_ROOT = "/content/unseen_images"  # class-wise folders
 UNSEEN_ZIP = "/content/drive/MyDrive/PhD/DataSets/unseen_images.zip"  # folder with class subfolders
 MODEL_PATH = "/content/drive/MyDrive/PhD/Models/best_gcn_from_efficientnetb0.pth"
+TRAINING_MODEL_PATH = "/content/drive/MyDrive/PhD/PhD_EfficientNetB0_GCN_Exp_V1/best_gcn_from_efficientnetb0.pth"
 TRAIN_ROOT = "/content/content/dataset_split/train"  # used to preserve label order
+EMBEDDING_DIM = 256
 # ======================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,9 +69,9 @@ for split in ["train", "val", "test"]:
 if not os.path.exists("/content/content/unseen"):
     import subprocess
     subprocess.run(["unzip", "-q", UNSEEN_ZIP, "-d", "/content/"], check=True)
-    print(f"Unzipped dataset into: {"/content/content/unseen"}")
+    print("Unzipped dataset into: /content/content/unseen")
 else:
-    print(f"Dataset already exists at: {"/content/content/unseen"}")
+    print("Dataset already exists at: /content/content/unseen")
 
 """# =============================
 # 2) Match training GCN architecture
@@ -76,11 +79,12 @@ else:
 """
 
 class GCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.5):
+    def __init__(self, in_channels, hidden_channels, embedding_channels, dropout=0.5):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
-        self.conv3 = GCNConv(hidden_channels, out_channels)
+        # (b) modified GCN output: refined embeddings, not class logits
+        self.conv3 = GCNConv(hidden_channels, embedding_channels)
         self.dropout = dropout
 
     def forward(self, x, edge_index):
@@ -94,6 +98,38 @@ class GCN(torch.nn.Module):
 
         x = self.conv3(x, edge_index)
         return x
+
+
+# (a) new ArcFace module
+class ArcFaceLoss(nn.Module):
+    def __init__(self, embedding_dim, num_classes, scale=30.0, margin=0.5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_classes, embedding_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.scale = scale
+        self.margin = margin
+        self.cos_m = math.cos(margin)
+        self.sin_m = math.sin(margin)
+        self.th = math.cos(math.pi - margin)
+        self.mm = math.sin(math.pi - margin) * margin
+
+    def logits(self, embeddings):
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        weights = F.normalize(self.weight, p=2, dim=1)
+        return F.linear(embeddings, weights) * self.scale
+
+    def forward(self, embeddings, labels):
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        weights = F.normalize(self.weight, p=2, dim=1)
+        cosine = F.linear(embeddings, weights).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        one_hot = F.one_hot(labels, num_classes=self.weight.size(0)).float()
+        logits = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        logits = logits * self.scale
+        return F.cross_entropy(logits, labels), logits
 
 """
 # =============================
@@ -218,16 +254,34 @@ in_channels = data_unseen.x.shape[1]
 gcn_model = GCN(
     in_channels=in_channels,
     hidden_channels=512,
-    out_channels=num_classes,
+    embedding_channels=EMBEDDING_DIM,
     dropout=0.5,
 ).to(DEVICE)
+criterion = ArcFaceLoss(embedding_dim=EMBEDDING_DIM, num_classes=num_classes, scale=30.0, margin=0.5).to(DEVICE)
 
-state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-gcn_model.load_state_dict(state_dict)
+# Checkpoint: must be saved by the ArcFace training script
+checkpoint_path = MODEL_PATH if os.path.exists(MODEL_PATH) else TRAINING_MODEL_PATH
+if not os.path.exists(checkpoint_path):
+    raise FileNotFoundError(f"No ArcFace checkpoint found at {MODEL_PATH} or {TRAINING_MODEL_PATH}")
+
+checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+required_keys = {"gcn_model", "arcface"}
+if not isinstance(checkpoint, dict) or not required_keys.issubset(checkpoint):
+    raise ValueError("Expected ArcFace checkpoint with 'gcn_model' and 'arcface' states.")
+
+if checkpoint.get("embedding_dim", EMBEDDING_DIM) != EMBEDDING_DIM:
+    raise ValueError(
+        f"Checkpoint embedding_dim={checkpoint.get('embedding_dim')} does not match EMBEDDING_DIM={EMBEDDING_DIM}."
+    )
+
+gcn_model.load_state_dict(checkpoint["gcn_model"])
+criterion.load_state_dict(checkpoint["arcface"])
 gcn_model.eval()
+criterion.eval()
 
 with torch.no_grad():
-    logits = gcn_model(data_unseen.x, data_unseen.edge_index)
+    embeddings = gcn_model(data_unseen.x, data_unseen.edge_index)
+    logits = criterion.logits(embeddings)
 
 pred = logits.argmax(dim=1).cpu().numpy()
 true = data_unseen.y.cpu().numpy()
@@ -269,4 +323,3 @@ plt.show()
 print("\nSample predictions:")
 for i in range(min(10, len(paths_unseen))):
     print(f"{i:03d}: true={class_names[true[i]]}, pred={class_names[pred[i]]}, path={paths_unseen[i]}")
-

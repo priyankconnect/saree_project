@@ -255,8 +255,9 @@ class ArcFaceLoss(nn.Module):
 num_features = data.x.shape[1]
 num_classes = int(data.y.max().item() + 1)
 embedding_dim = 256
+hidden_dim = 512
 
-gcn_model = GCN(in_channels=num_features, hidden_channels=512, embedding_channels=embedding_dim, dropout=0.5).to(DEVICE)
+gcn_model = GCN(in_channels=num_features, hidden_channels=hidden_dim, embedding_channels=embedding_dim, dropout=0.5).to(DEVICE)
 criterion = ArcFaceLoss(embedding_dim=embedding_dim, num_classes=num_classes, scale=30.0, margin=0.5).to(DEVICE)
 data = data.to(DEVICE)
 
@@ -290,6 +291,23 @@ EPOCHS = 200
 best_val_acc = 0.0
 history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
+
+def make_checkpoint(epoch, best_val_acc):
+    return {
+        "epoch": epoch,
+        "best_val_acc": best_val_acc,
+        "gcn_model": gcn_model.state_dict(),
+        "arcface": criterion.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "in_channels": num_features,
+        "hidden_channels": hidden_dim,
+        "embedding_dim": embedding_dim,
+        "num_classes": num_classes,
+        "loss": "ArcFaceLoss",
+        "scale": criterion.scale,
+        "margin": criterion.margin,
+    }
+
 for epoch in range(1, EPOCHS + 1):
     gcn_model.train()
     criterion.train()
@@ -310,10 +328,8 @@ for epoch in range(1, EPOCHS + 1):
 
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save({
-            "gcn_model": gcn_model.state_dict(),
-            "arcface": criterion.state_dict(),
-        }, MODEL_SAVE_PATH)
+        # Checkpoint: GCN refined embeddings + ArcFace classification head
+        torch.save(make_checkpoint(epoch, best_val_acc), MODEL_SAVE_PATH)
 
     if epoch % 10 == 0 or epoch == 1:
         print(
@@ -323,9 +339,13 @@ for epoch in range(1, EPOCHS + 1):
         )
 
 print("Best Val Acc:", best_val_acc)
+if not os.path.exists(MODEL_SAVE_PATH):
+    torch.save(make_checkpoint(EPOCHS, best_val_acc), MODEL_SAVE_PATH)
+    print(f"Saved final checkpoint to {MODEL_SAVE_PATH}")
 
 import shutil
 
+os.makedirs(os.path.dirname(MODEL_DRIVE_PATH), exist_ok=True)
 shutil.copy(MODEL_SAVE_PATH,
             MODEL_DRIVE_PATH)
 
