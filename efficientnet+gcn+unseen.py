@@ -42,10 +42,10 @@ DATASET_ZIP = "/content/drive/MyDrive/PhD/DataSets/dataset_split.zip"
 DATASET_ROOT = "/content/content/dataset_split"
 UNSEEN_ROOT = "/content/unseen_images"  # class-wise folders
 UNSEEN_ZIP = "/content/drive/MyDrive/PhD/DataSets/unseen_images.zip"  # folder with class subfolders
-MODEL_PATH = "/content/drive/MyDrive/PhD/Models/best_gcn_from_efficientnetb0.pth"
-TRAINING_MODEL_PATH = "/content/drive/MyDrive/PhD/PhD_EfficientNetB0_GCN_Exp_V1/best_gcn_from_efficientnetb0.pth"
 TRAIN_ROOT = "/content/content/dataset_split/train"  # used to preserve label order
 EMBEDDING_DIM = 256
+HIDDEN_DIM = 512
+EPOCHS = 200
 # ======================
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -175,6 +175,41 @@ feature_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+def extract_split_embeddings(split_dir: str, model, transform, device, class_to_idx):
+    embeddings, labels, paths = [], [], []
+
+    for cls_name in sorted(os.listdir(split_dir)):
+        cls_dir = os.path.join(split_dir, cls_name)
+        if not os.path.isdir(cls_dir):
+            continue
+
+        if cls_name not in class_to_idx:
+            print(f"Skipping class '{cls_name}' (not present in class list)")
+            continue
+
+        for fname in tqdm(sorted(os.listdir(cls_dir)), desc=f"Extracting {os.path.basename(split_dir)}:{cls_name}"):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+
+            img_path = os.path.join(cls_dir, fname)
+            try:
+                img = Image.open(img_path).convert("RGB")
+                x = transform(img).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    feat = model(x)
+                embeddings.append(feat.squeeze().cpu().numpy())
+                labels.append(class_to_idx[cls_name])
+                paths.append(img_path)
+            except Exception as e:
+                print(f"Skipping {img_path}: {e}")
+
+    return (
+        np.array(embeddings, dtype=np.float32),
+        np.array(labels, dtype=np.int64),
+        np.array(paths),
+    )
+
+
 def extract_unseen_embeddings(unseen_root: str, model, transform, device, class_to_idx):
     embeddings, labels, paths = [], [], []
 
@@ -210,6 +245,126 @@ def extract_unseen_embeddings(unseen_root: str, model, transform, device, class_
     )
 
 
+"""# =============================
+# 5) Train fresh GCN + ArcFace head
+# =============================
+"""
+
+def build_knn_edge_index(features: np.ndarray, k: int = 10):
+    k = min(k, len(features) - 1)
+    if k < 1:
+        raise ValueError("Need at least 2 images to build a kNN graph.")
+
+    nbrs = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
+    nbrs.fit(features)
+    _, indices = nbrs.kneighbors(features)
+
+    src, dst = [], []
+    for i in range(indices.shape[0]):
+        for j in indices[i, 1:]:
+            src.append(i)
+            dst.append(int(j))
+            src.append(int(j))
+            dst.append(i)
+
+    return np.vstack([src, dst])
+
+
+def accuracy(logits, labels):
+    pred = logits.argmax(dim=1)
+    return (pred == labels).float().mean().item()
+
+
+def evaluate_training_graph(model, criterion, data, mask):
+    model.eval()
+    criterion.eval()
+    with torch.no_grad():
+        embeddings = model(data.x, data.edge_index)
+        loss, logits = criterion(embeddings[mask], data.y[mask])
+        acc = accuracy(logits, data.y[mask])
+    return loss.item(), acc
+
+
+train_dir = os.path.join(DATASET_ROOT, "train")
+val_dir = os.path.join(DATASET_ROOT, "val")
+
+X_train, y_train, paths_train = extract_split_embeddings(
+    train_dir, feature_model, feature_transform, DEVICE, class_to_idx
+)
+X_val, y_val, paths_val = extract_split_embeddings(
+    val_dir, feature_model, feature_transform, DEVICE, class_to_idx
+)
+
+assert len(X_train) > 1, "Need at least 2 train images to build a training graph."
+assert len(X_val) > 0, "Need at least 1 validation image."
+
+X_train_graph = np.vstack([X_train, X_val]).astype(np.float32)
+y_train_graph = np.concatenate([y_train, y_val]).astype(np.int64)
+edge_index_train_np = build_knn_edge_index(X_train_graph, k=10)
+
+train_mask = torch.zeros(len(X_train_graph), dtype=torch.bool)
+val_mask = torch.zeros(len(X_train_graph), dtype=torch.bool)
+train_mask[:len(X_train)] = True
+val_mask[len(X_train):] = True
+
+data_train = Data(
+    x=torch.tensor(X_train_graph, dtype=torch.float32),
+    edge_index=torch.tensor(edge_index_train_np, dtype=torch.long),
+    y=torch.tensor(y_train_graph, dtype=torch.long),
+    train_mask=train_mask,
+    val_mask=val_mask,
+).to(DEVICE)
+
+gcn_model = GCN(
+    in_channels=data_train.x.shape[1],
+    hidden_channels=HIDDEN_DIM,
+    embedding_channels=EMBEDDING_DIM,
+    dropout=0.5,
+).to(DEVICE)
+criterion = ArcFaceLoss(embedding_dim=EMBEDDING_DIM, num_classes=num_classes, scale=30.0, margin=0.5).to(DEVICE)
+
+optimizer = torch.optim.Adam(
+    list(gcn_model.parameters()) + list(criterion.parameters()),
+    lr=1e-3,
+    weight_decay=5e-4,
+)
+
+best_val_acc = 0.0
+history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+
+for epoch in range(1, EPOCHS + 1):
+    gcn_model.train()
+    criterion.train()
+    optimizer.zero_grad()
+
+    embeddings = gcn_model(data_train.x, data_train.edge_index)
+    loss, train_logits = criterion(embeddings[data_train.train_mask], data_train.y[data_train.train_mask])
+    loss.backward()
+    optimizer.step()
+
+    train_acc = accuracy(train_logits, data_train.y[data_train.train_mask])
+    val_loss, val_acc = evaluate_training_graph(gcn_model, criterion, data_train, data_train.val_mask)
+
+    history["train_loss"].append(loss.item())
+    history["train_acc"].append(train_acc)
+    history["val_loss"].append(val_loss)
+    history["val_acc"].append(val_acc)
+    best_val_acc = max(best_val_acc, val_acc)
+
+    if epoch % 10 == 0 or epoch == 1:
+        print(
+            f"Epoch {epoch:03d} | "
+            f"Train Loss {loss.item():.4f} | Train Acc {train_acc:.4f} | "
+            f"Val Loss {val_loss:.4f} | Val Acc {val_acc:.4f}"
+        )
+
+print("Best Val Acc:", best_val_acc)
+
+"""# =============================
+# 6) Build unseen graph (kNN)
+# =============================
+"""
+
 X_unseen, y_unseen, paths_unseen = extract_unseen_embeddings(
     UNSEEN_ROOT, feature_model, feature_transform, DEVICE, class_to_idx
 )
@@ -218,25 +373,7 @@ print("Unseen labels shape:", y_unseen.shape)
 
 assert len(X_unseen) > 1, "Need at least 2 unseen images to build a kNN graph."
 
-"""# =============================
-# 5) Build unseen graph (kNN)
-# =============================
-"""
-
-K = min(10, len(X_unseen) - 1)
-nbrs = NearestNeighbors(n_neighbors=K + 1, metric="cosine")
-nbrs.fit(X_unseen)
-_, indices = nbrs.kneighbors(X_unseen)
-
-src, dst = [], []
-for i in range(indices.shape[0]):
-    for j in indices[i, 1:]:
-        src.append(i)
-        dst.append(int(j))
-        src.append(int(j))
-        dst.append(i)
-
-edge_index_np = np.vstack([src, dst])
+edge_index_np = build_knn_edge_index(X_unseen, k=10)
 print("edge_index shape:", edge_index_np.shape)
 
 x_tensor = torch.tensor(X_unseen, dtype=torch.float32)
@@ -246,36 +383,10 @@ edge_index = torch.tensor(edge_index_np, dtype=torch.long)
 data_unseen = Data(x=x_tensor, edge_index=edge_index, y=y_tensor).to(DEVICE)
 
 """# =============================
-# 6) Load model + evaluate unseen accuracy
+# 7) Evaluate unseen accuracy with freshly trained model
 # =============================
 """
 
-in_channels = data_unseen.x.shape[1]
-gcn_model = GCN(
-    in_channels=in_channels,
-    hidden_channels=512,
-    embedding_channels=EMBEDDING_DIM,
-    dropout=0.5,
-).to(DEVICE)
-criterion = ArcFaceLoss(embedding_dim=EMBEDDING_DIM, num_classes=num_classes, scale=30.0, margin=0.5).to(DEVICE)
-
-# Checkpoint: must be saved by the ArcFace training script
-checkpoint_path = MODEL_PATH if os.path.exists(MODEL_PATH) else TRAINING_MODEL_PATH
-if not os.path.exists(checkpoint_path):
-    raise FileNotFoundError(f"No ArcFace checkpoint found at {MODEL_PATH} or {TRAINING_MODEL_PATH}")
-
-checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-required_keys = {"gcn_model", "arcface"}
-if not isinstance(checkpoint, dict) or not required_keys.issubset(checkpoint):
-    raise ValueError("Expected ArcFace checkpoint with 'gcn_model' and 'arcface' states.")
-
-if checkpoint.get("embedding_dim", EMBEDDING_DIM) != EMBEDDING_DIM:
-    raise ValueError(
-        f"Checkpoint embedding_dim={checkpoint.get('embedding_dim')} does not match EMBEDDING_DIM={EMBEDDING_DIM}."
-    )
-
-gcn_model.load_state_dict(checkpoint["gcn_model"])
-criterion.load_state_dict(checkpoint["arcface"])
 gcn_model.eval()
 criterion.eval()
 
